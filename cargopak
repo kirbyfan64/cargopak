@@ -1,0 +1,119 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use v5.10;
+
+use File::Temp qw(tempdir);
+use List::Util qw(any);
+use Cwd qw(getcwd);
+
+my $RUNTIME_VERSION = 1.6;
+my $RUNTIME = "org.freedesktop.Platform";
+my $SDK = "org.freedesktop.Sdk";
+my $RUST = "org.freedesktop.Sdk.Extension.rust-stable";
+
+my $HOME = $ENV{HOME};
+my $STORAGE = "$HOME/.cargopak";
+my $BIN = "$STORAGE/bin";
+
+if (!defined($ARGV[0]) || $ARGV[0] eq '-h' || $ARGV[0] eq '--help') {
+  say 'usage: cargopak <package to install> [cargo args...]';
+  say 'See man cargopak for more info.';
+  exit !defined($ARGV[0]);
+}
+
+system ('flatpak', 'run', "--runtime=$RUNTIME//$RUNTIME_VERSION",
+        "$RUST//$RUNTIME_VERSION", '-c', 'exit') and exit $?;
+
+my $crate = $ARGV[0];
+$crate =~ "[ ']" and die "Invalid crate: '$crate'\n";
+
+my $data = `curl -s 'https://crates.io/api/v1/crates/$crate'`;
+$data =~ '"errors"' and die "Invalid crate: '$crate'\n";
+
+my $id = $ENV{CARGOPAK_ID};
+
+sub is_rdns_method {
+  my ($method) = @_;
+  return ($ENV{CARGOPAK_RDNS_METHOD} || $method) eq $method;
+}
+
+if (!defined($id)) {
+  my $base;
+
+  if (is_rdns_method 'homepage') {
+    my ($homepage) = $data =~ '"homepage":"([^"]+)"';
+    $base = $homepage;
+  }
+  goto have_id if defined($base);
+
+  if (is_rdns_method 'repository') {
+    my ($repo) = $data =~ '"repository":"([^"]+://[^"]+)"';
+    $base = $repo;
+  }
+  goto have_id if defined($base);
+
+  if (is_rdns_method 'simple') {
+    $base = 'crates.io';
+  }
+  goto have_id if defined($base);
+
+  die "Invalid RDNS method: $ENV{CARGOPAK_RDNS_METHOD}\n";
+
+  have_id:
+
+  $base =~ s|github.com|github.io|;
+  $base =~ s|.*://||;
+  $base =~ s|/.*||;
+  $base =~ s|^www\.||;
+  $base =~ s|-||;
+
+  my @parts = split /\./, $base;
+  $base = join '.', reverse @parts;
+
+  (my $last = $ENV{CARGOPAK_RDNS_LAST} || $crate) =~ s/(?:^|[-_])([a-z])/uc $1/eg;
+
+  $id = "$base.$last";
+}
+
+say "Using id: $id";
+
+my $temp = tempdir(CLEANUP => 1);
+my $build = "$temp/build";
+my $repo = "$temp/repo";
+
+say "Beginning build in $temp...";
+
+sub flatpak {
+  system "flatpak", @_ and exit $?;
+}
+
+flatpak 'build-init', "--sdk-extension=$RUST", $build, $id, $SDK, $RUNTIME, $RUNTIME_VERSION;
+flatpak 'build', '--share=network', "--persist=$STORAGE", "--env=CARGO_HOME=$STORAGE",
+        '--env=PATH=/usr/lib/sdk/rust-stable/bin:/app/bin:/usr/bin', $build, 'cargo', 'install',
+        '--root', '/app', $crate;
+
+my $cwd = getcwd;
+chdir "$build/files/bin";
+
+my @binaries = <*>;
+my $desired = $ENV{CARGOPAK_BINARY};
+
+if (@binaries != 1) {
+  die 'Error: multiple binaries were installed (set CARGOPAK_BINARY to the desired one): ',
+    join ', ', @binaries if !defined($desired);
+} elsif (defined($desired)) {
+  die "Invalid binary: $desired" if !any { $_ eq $desired } @binaries;
+} else {
+  $desired = $binaries[0];
+}
+
+chdir $cwd;
+
+flatpak 'build-finish', $build, '--filesystem=host', "--command=$desired";
+flatpak 'build-export', $repo, $build;
+flatpak 'install', $repo, $id;
+
+mkdir "$BIN" if ! -d "$BIN";
+symlink ("/var/lib/flatpak/exports/bin/$id", "$BIN/$desired");
